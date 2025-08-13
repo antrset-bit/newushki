@@ -10,6 +10,7 @@ google-genai>=0.3.0
 requests>=2.31
 filelock>=3.13
 python-dotenv>=1.0
+python-docx>=1.1.0
 # Для gspread-доступа (необязательно):
 # gspread>=6.0
 # google-auth>=2.30
