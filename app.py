@@ -17,7 +17,7 @@ import numpy as np
 import faiss
 
 from fastapi import FastAPI, Request, Response
-from telegram import Update, Document, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, Document, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 import fitz  # PyMuPDF
@@ -28,9 +28,7 @@ from docx import Document as DocxDocument
 from google import genai
 from google.genai import types
 
-# New deps
 import requests
-from filelock import FileLock
 
 # ------------ ЛОГИ ------------
 logging.basicConfig(level=logging.INFO)
@@ -49,37 +47,36 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY не задан")
 
-# Пути. По умолчанию используем /tmp, чтобы не падать без диска.
+# Пути
 DOC_FOLDER = os.getenv("DOC_FOLDER", "/tmp/documents")
 INDEX_FILE = os.getenv("FAISS_INDEX", "/tmp/index.faiss")
 TEXTS_FILE = os.getenv("TEXTS_FILE", "/tmp/texts.pkl")
 MANIFEST_FILE = os.getenv("MANIFEST_FILE", "/tmp/manifest.json")
-
-# Новые файлы/переменные для AI-чата и лимитов
 USAGE_FILE = os.getenv("USAGE_FILE", "/tmp/usage.json")
+
 DAILY_FREE_LIMIT = int(os.getenv("DAILY_FREE_LIMIT", "10"))
-ADMIN_USER_IDS = set(
-    int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
-)
+ADMIN_USER_IDS = set(int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit())
 
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "2048"))
 RETRIEVAL_K = int(os.getenv("RETRIEVAL_K", "6"))
-CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "1200"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 
-TELEGRAM_MSG_LIMIT = 4096  # лимит Телеграма
+# --- параметры умного деления на чанки ---
+CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "2000"))
+CHUNK_MIN_CHARS = int(os.getenv("CHUNK_MIN_CHARS", "400"))
+SUBCHUNK_MAX_CHARS = int(os.getenv("SUBCHUNK_MAX_CHARS", "1600"))
+TELEGRAM_MSG_LIMIT = 4096
 
 # ------------ ТОВАРНЫЕ ЗНАКИ (Google Sheets) ------------
-TM_SHEET_ID = os.getenv("TM_SHEET_ID", "11x-cx1fH4TtGHYTpYtpLj2XsTfTOMkk4_zVQOv-X0jI").strip()
+TM_SHEET_ID = os.getenv("TM_SHEET_ID", "").strip()
 TM_SHEET_NAME = os.getenv("TM_SHEET_NAME", "Лист1").strip()
-TM_SHEET_GID = os.getenv("TM_SHEET_GID", "0").strip()  # GID листа для CSV-экспорта
+TM_SHEET_GID = os.getenv("TM_SHEET_GID", "0").strip()
 TM_ENABLE = os.getenv("TM_ENABLE", "1") == "1"
+TM_SHEET_CSV_URL = os.getenv("TM_SHEET_CSV_URL", "").strip()
+TM_DEBUG = os.getenv("TM_DEBUG", "0") == "1"
 
-# Режим чтения: CSV без OAuth (если таблица опубликована) или через сервис-аккаунт
-TM_ACCESS_MODE = os.getenv("TM_ACCESS_MODE", "csv").strip()  # 'csv' | 'gspread'
-TM_GSVCRED = os.getenv("TM_GSVCRED", "")  # путь к JSON сервис-аккаунта для gspread
-
-TM_LABELS = ['№', 'Номер заявки', 'Номер регистрации', '', 'Описание', 'Статус', 'Срок действия', 'Комментарии', '', 'Ссылка']
+# ------------ Режим запуска ------------
+RUN_MODE = os.getenv("RUN_MODE", "polling").strip().lower()  # "polling" | "webhook"
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 # ------------ КНОПКИ UI ------------
 AI_LABEL = "🤖 AI-чат"
@@ -87,7 +84,9 @@ DOCS_LABEL = "📄 Вопросы по документам"
 TM_LABEL = "🏷️ Товарные знаки"
 MAIN_KB = ReplyKeyboardMarkup([[AI_LABEL, DOCS_LABEL, TM_LABEL]], resize_keyboard=True)
 
-# Гарантируем, что каталоги существуют
+TM_LABELS = ['№', 'Номер заявки', 'Номер регистрации', '', 'Описание', 'Статус', 'Срок действия', 'Комментарии', '', 'Ссылка']
+
+# Гарантируем каталоги
 def _ensure_dir(path: str) -> bool:
     try:
         Path(path).mkdir(parents=True, exist_ok=True)
@@ -96,7 +95,6 @@ def _ensure_dir(path: str) -> bool:
         return False
 
 if not _ensure_dir(DOC_FOLDER):
-    # Фоллбек в /opt или /tmp
     base = "/opt/render/project/src/data"
     if not _ensure_dir(base):
         base = "/tmp/data"
@@ -118,7 +116,6 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ------------ ХЕЛПЕРЫ ЛИМИТА ------------
 def _today_str() -> str:
-    # Используем локальное время контейнера
     return time.strftime("%Y-%m-%d", time.localtime())
 
 def _load_usage() -> dict:
@@ -202,7 +199,6 @@ def extract_text_from_pdf(file_path: str) -> str:
             return text
     except Exception as e:
         logger.warning("PyMuPDF не смог извлечь текст (%s). Переходим к OCR.", repr(e))
-    # OCR fallback (требуются poppler + tesseract в образе)
     try:
         images = convert_from_path(file_path)
         ocr_texts = [pytesseract.image_to_string(img) for img in images]
@@ -230,24 +226,164 @@ def extract_text_from_txt(file_path: str) -> str:
         logger.error("Ошибка чтения TXT: %s", repr(e))
         return ""
 
-# ------------ ЧАНКИНГ ------------
-def split_text(text: str, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK_OVERLAP) -> List[str]:
-    text = re.sub(r"\r\n?|\u00A0", "\n", text)
-    sentences = re.split(r"(?<=[\.!?…])\s+", text)
-    chunks, buf = [], ""
-    for s in sentences:
-        s = s.strip()
-        if not s:
-            continue
-        if len(buf) + len(s) + 1 > max_chars and buf:
-            chunks.append(buf.strip())
-            tail = buf[-overlap:] if overlap > 0 else ""
-            buf = (tail + " " + s).strip()
+# ------------ УМНОЕ ДЕЛЕНИЕ НА ЧАНКИ ------------
+CONTRACT_SECTIONS = [
+    "Предмет договора","Права и обязанности сторон","Обязанности сторон","Гарантии сторон","Ответственность сторон",
+    "Срок действия договора","Финансовые условия","Стоимость услуг и порядок оплаты","Порядок оплаты","Термины и определения",
+    "Прочие условия","Обстоятельства непреодолимой силы","Форс-мажор","Конфиденциальность","Право на использование изображений",
+    "Порядок использования результатов интеллектуальной деятельности","Заверения обстоятельства",
+    "Адрес и банковские реквизиты","Реквизиты и подписи сторон","Подписи сторон"
+]
+POSITION_SECTIONS = [
+    "Общие положения","Цели и задачи","Предмет регулирования","Термины и определения","Функции","Права и обязанности",
+    "Права организации","Обязанности организации","Ответственность","Порядок взаимодействия","Организация работы",
+    "Порядок внесения изменений","Заключительные положения"
+]
+GENERIC_SECTIONS = [
+    "Введение","Общие положения","Термины и определения","Порядок","Права и обязанности","Права","Обязанности","Ответственность",
+    "Срок действия","Финансовые условия","Порядок оплаты","Конфиденциальность","Прочие условия","Заключительные положения","Приложения"
+]
+
+HEAD_NUM_RE = re.compile(r"^(?:раздел|глава|section|chapter)\s+\d+[.:)]?$", re.IGNORECASE|re.MULTILINE)
+HEAD_NUM2_RE = re.compile(r"^\d+(?:\.\d+)*[.)]?\s+\S+", re.MULTILINE)
+HEAD_ROMAN_RE = re.compile(r"^(?:[IVXLCDM]+)[\.\)]\s+\S+", re.IGNORECASE|re.MULTILINE)
+
+def guess_doc_type(text: str) -> str:
+    head = text[:5000].lower()
+    if "договор" in head:
+        return "contract"
+    if "положение" in head:
+        return "position"
+    return "generic"
+
+def is_all_caps_cyr(line: str) -> bool:
+    s = line.strip()
+    if len(s) < 3 or len(s) > 120:
+        return False
+    letters = [ch for ch in s if ch.isalpha()]
+    if not letters:
+        return False
+    upp = sum(1 for ch in letters if ch.upper() == ch and "а" <= ch.lower() <= "я")
+    return upp >= max(3, int(0.7 * len(letters)))
+
+def find_headings(text: str, headings: List[str]) -> List[tuple[int,str]]:
+    res = []
+    for h in headings:
+        for m in re.finditer(rf"(?im)^\s*{re.escape(h)}\s*$", text):
+            res.append((m.start(), h))
+    for m in HEAD_NUM_RE.finditer(text):
+        res.append((m.start(), text[m.start():m.end()]))
+    for m in HEAD_NUM2_RE.finditer(text):
+        res.append((m.start(), text[m.start():m.end()].strip()))
+    for m in HEAD_ROMAN_RE.finditer(text):
+        res.append((m.start(), text[m.start():m.end()].strip()))
+    for m in re.finditer(r"(?m)^(?P<line>.+)$", text):
+        line = m.group("line")
+        if is_all_caps_cyr(line):
+            res.append((m.start(), line.strip()))
+    uniq = {}
+    for off, ttl in res:
+        uniq[off] = ttl
+    return sorted(uniq.items(), key=lambda x: x[0])
+
+def split_by_sections(text: str, headings: List[str]) -> List[tuple[str,str]]:
+    marks = find_headings(text, headings)
+    if not marks:
+        return [("", text.strip())]
+    chunks = []
+    for i, (start, title) in enumerate(marks):
+        end = marks[i+1][0] if i+1 < len(marks) else len(text)
+        chunk = text[start:end].strip()
+        lines = chunk.splitlines()
+        if lines:
+            first_line = lines[0].strip()
+            if len(first_line) <= 180:
+                title = first_line
+        chunks.append((title.strip(), chunk))
+    return chunks
+
+def split_long_chunk(title: str, body: str) -> List[str]:
+    paras = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
+    out = []
+    cur = title + "\n"
+    for p in paras:
+        add_len = 2 + len(p) if cur.strip() != title else len(p)
+        if len(cur) + add_len > SUBCHUNK_MAX_CHARS and cur.strip():
+            out.append(cur.strip())
+            cur = title + "\n" + p
         else:
-            buf = (buf + " " + s).strip()
+            if cur.strip() == title:
+                cur = title + "\n" + p
+            else:
+                cur += "\n\n" + p
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+def smart_split_text(text: str) -> List[str]:
+    if not text or len(text.strip()) == 0:
+        return []
+    text = re.sub(r"\r\n?", "\n", text)
+
+    doc_type = guess_doc_type(text)
+    base_sections = CONTRACT_SECTIONS if doc_type=="contract" else POSITION_SECTIONS if doc_type=="position" else GENERIC_SECTIONS
+
+    section_chunks = split_by_sections(text, base_sections)
+
+    normalized: List[str] = []
+    buf = ""
+    for title, chunk in section_chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if len(chunk) < CHUNK_MIN_CHARS and buf:
+            buf += "\n\n" + chunk
+            continue
+        if buf:
+            normalized.append(buf)
+        buf = chunk
     if buf:
-        chunks.append(buf.strip())
-    return [c for c in chunks if c]
+        normalized.append(buf)
+
+    final_chunks: List[str] = []
+    for ch in normalized:
+        if len(ch) <= CHUNK_MAX_CHARS:
+            final_chunks.append(ch)
+        else:
+            lines = ch.splitlines()
+            title = lines[0].strip() if lines else "Раздел"
+            body = "\n".join(lines[1:]).strip() if len(lines) > 1 else ch
+            parts = split_long_chunk(title, body)
+            for p in parts:
+                if len(p) > CHUNK_MAX_CHARS:
+                    sents = re.split(r"(?<=[.!?…])\s+", p)
+                    tmp = ""
+                    for s in sents:
+                        if len(tmp) + len(s) + 1 > CHUNK_MAX_CHARS:
+                            if tmp.strip():
+                                final_chunks.append(tmp.strip())
+                            tmp = s
+                        else:
+                            tmp = (tmp + " " + s).strip()
+                    if tmp.strip():
+                        final_chunks.append(tmp.strip())
+                else:
+                    final_chunks.append(p.strip())
+
+    if not final_chunks:
+        sents = re.split(r"(?<=[.!?…])\s+", text)
+        tmp = ""
+        for s in sents:
+            if len(tmp) + len(s) + 1 > CHUNK_MAX_CHARS:
+                if tmp.strip():
+                    final_chunks.append(tmp.strip())
+                tmp = s
+            else:
+                tmp = (tmp + " " + s).strip()
+        if tmp.strip():
+            final_chunks.append(tmp.strip())
+
+    return [c for c in final_chunks if c and c.strip()]
 
 # ------------ ЭМБЕДДИНГИ/ИНДЕКС ------------
 def get_embedding(text: str) -> np.ndarray:
@@ -288,9 +424,11 @@ def index_file(file_path: str) -> Tuple[int, int]:
     if not text:
         logger.warning("Пустой текст после извлечения: %s", os.path.basename(file_path))
         return (0, 0)
-    chunks = split_text(text)
+
+    chunks = smart_split_text(text)
     if not chunks:
         return (0, 0)
+
     texts = load_texts()
     first_vec = None
     for ch in chunks:
@@ -309,7 +447,7 @@ def index_file(file_path: str) -> Tuple[int, int]:
             emb = get_embedding(ch)
             new_embeddings.append(emb)
             new_texts.append(ch)
-            time.sleep(0.05)
+            time.sleep(0.02)
         except Exception as e:
             logger.warning("Пропущен чанк из-за ошибки эмбеддинга: %s", repr(e))
             continue
@@ -336,7 +474,7 @@ def retrieve_chunks(query: str, k: int = RETRIEVAL_K) -> List[str]:
     ids = [i for i in I[0] if 0 <= i < len(texts)]
     return [texts[i] for i in ids]
 
-# ------------ ГЕНЕРАЦИЯ + ДЕЛЕНИЕ ДЛИННЫХ ОТВЕТОВ ------------
+# ------------ ГЕНЕРАЦИЯ ------------
 def generate_answer_with_gemini(user_query: str, retrieved_chunks: List[str]) -> str:
     context = "\n\n".join(retrieved_chunks[:RETRIEVAL_K]) if retrieved_chunks else "(контекст не найден)"
     prompt = (
@@ -379,13 +517,12 @@ def generate_answer_with_gemini(user_query: str, retrieved_chunks: List[str]) ->
             return "⚠️ Неверный ключ или нет доступа."
         return f"⚠️ Ошибка: {msg}"
 
-# Новая: генерация прямого ответа без РАГ
 def generate_direct_ai_answer(user_query: str) -> str:
     system = (
         "Ты — внимательный и полезный ассистент. Отвечай чётко, по делу. "
         "Если вопрос юридический и у пользователя нет документов, давай общий совет и предупреждай о необходимости проверки юристом."
     )
-    prompt = f"СИСТЕМА:\n{system}\n\nЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{user_query}"
+    prompt = f"СИСТЕМА:\\n{system}\\n\\nЗАПРОС ПОЛЬЗОВАТЕЛЯ:\\n{user_query}"
     try:
         resp = client.models.generate_content(
             model=TEXT_MODEL_NAME,
@@ -406,43 +543,31 @@ def generate_direct_ai_answer(user_query: str) -> str:
             return "⚠️ Неверный ключ или нет доступа."
         return f"⚠️ Ошибка: {msg}"
 
-
 def _split_for_telegram(text: str, max_len: int = TELEGRAM_MSG_LIMIT - 200) -> list[str]:
-    """Делит текст на блоки < max_len. Сначала по абзацам, потом по символам при необходимости."""
     parts, buf = [], []
     cur = 0
-    paragraphs = text.replace("\r\n", "\n").split("\n\n")
-
+    paragraphs = text.replace("\\r\\n", "\\n").split("\\n\\n")
     for p in paragraphs:
         p = p.strip()
         if not p:
-            candidate = "\n\n".join(buf).strip()
+            candidate = "\\n\\n".join(buf).strip()
             if candidate:
                 parts.append(candidate)
                 buf, cur = [], 0
             continue
-
-        # помещается в текущий блок
         delta = len(p) + (2 if cur > 0 else 0)
         if cur + delta <= max_len:
-            buf.append(p)
-            cur += delta
+            buf.append(p); cur += delta
         else:
-            # вылить текущий буфер
-            candidate = "\n\n".join(buf).strip()
+            candidate = "\\n\\n".join(buf).strip()
             if candidate:
                 parts.append(candidate)
             buf, cur = [], 0
-
-            # если сам абзац длинный — резать
             while len(p) > max_len:
-                parts.append(p[:max_len])
-                p = p[max_len:]
+                parts.append(p[:max_len]); p = p[max_len:]
             if p:
-                buf = [p]
-                cur = len(p)
-
-    candidate = "\n\n".join(buf).strip()
+                buf = [p]; cur = len(p)
+    candidate = "\\n\\n".join(buf).strip()
     if candidate:
         parts.append(candidate)
     return parts
@@ -460,7 +585,7 @@ def _html_escape(text: str) -> str:
                 .replace("'", "&#039;"))
 
 def _is_image_url(url: str) -> bool:
-    return bool(re.search(r"\.(jpeg|jpg|gif|png)$", url.strip(), re.IGNORECASE))
+    return bool(re.match(r".+\\.(jpeg|jpg|gif|png)$", url.strip(), re.IGNORECASE))
 
 def _format_date(value: str) -> str:
     from datetime import datetime
@@ -471,23 +596,44 @@ def _format_date(value: str) -> str:
             pass
     return value.strip()
 
-async def _tm_fetch_rows_csv(sheet_id: str, gid: str) -> list[list[str]]:
+async def _tm_fetch_rows_csv(sheet_id: str, gid: str, sheet_name: str, override_url: str = "") -> list[list[str]]:
     import csv, io
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-    resp = await asyncio.to_thread(requests.get, url, timeout=30)
-    resp.raise_for_status()
-    content = resp.content.decode("utf-8", errors="replace")
-    reader = csv.reader(io.StringIO(content))
-    return [row for row in reader]
+    urls = []
+    if override_url:
+        urls.append(override_url)
+    if sheet_id:
+        urls.append(f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}")
+        urls.append(f"https://docs.google.com/spreadsheets/d/{sheet_id}/pub?gid={gid}&single=true&output=csv")
+        if sheet_name:
+            from urllib.parse import quote
+            urls.append(f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={quote(sheet_name)}")
+    last_err = None
+    for url in urls:
+        try:
+            resp = await asyncio.to_thread(requests.get, url, timeout=30)
+            status = resp.status_code
+            ctype = resp.headers.get("Content-Type", "")
+            content = resp.content.decode("utf-8", errors="replace")
+            if status == 200 and ("," in content or ";" in content or "\n" in content):
+                reader = csv.reader(io.StringIO(content))
+                rows = [row for row in reader]
+                if rows and any(any(cell.strip() for cell in row) for row in rows):
+                    return rows
+            last_err = f"Bad content from {url} (status={status}, type={ctype})"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e} at {url}"
+            continue
+    raise RuntimeError(last_err or "CSV fetch failed")
 
 async def tm_load_data() -> list[list[str]]:
     if not TM_ENABLE:
         return []
     try:
-        # Только CSV режим в этом бандле (без gspread). Для gspread см. README.
-        return await _tm_fetch_rows_csv(TM_SHEET_ID, TM_SHEET_GID)
+        return await _tm_fetch_rows_csv(TM_SHEET_ID, TM_SHEET_GID, TM_SHEET_NAME, TM_SHEET_CSV_URL)
     except Exception as e:
         logger.error("TM: не удалось загрузить данные листа: %s", repr(e))
+        if TM_DEBUG:
+            raise
         return []
 
 def tm_format_row(row: list[str], labels: list[str] = TM_LABELS) -> tuple[str, list[str]]:
@@ -496,20 +642,19 @@ def tm_format_row(row: list[str], labels: list[str] = TM_LABELS) -> tuple[str, l
     for idx, val in enumerate(row):
         label = labels[idx] if idx < len(labels) else ""
         if idx == 3:
-            continue  # пропустить 4-й столбец
+            continue
         cell = str(val or "").strip()
         if not cell:
             continue
         if _is_image_url(cell):
-            image_urls.append(cell)
-            continue
-        if re.match(r"^\d{1,4}[-./]\d{1,2}[-./]\d{1,4}$", cell):
+            image_urls.append(cell); continue
+        if re.match(r"^\\d{1,4}[-./]\\d{1,2}[-./]\\d{1,4}$", cell):
             cell = _format_date(cell)
         if label:
             formatted_lines.append(f"<b>{_html_escape(label)}:</b> {_html_escape(cell)}")
         else:
             formatted_lines.append(_html_escape(cell))
-    text = "\n".join(formatted_lines).strip()
+    text = "\\n".join(formatted_lines).strip()
     return text, image_urls
 
 def _row_matches_registered(row: list[str]) -> bool:
@@ -529,10 +674,23 @@ def _row_matches_keywords(row: list[str], keywords: list[str]) -> bool:
     return False
 
 async def tm_process_search(chat_id: int, condition_cb, context: ContextTypes.DEFAULT_TYPE):
-    data = await tm_load_data()
-    if not data or not any(data):
-        await context.bot.send_message(chat_id, "Данные листа недоступны или пусты.")
+    try:
+        data = await tm_load_data()
+    except Exception as e:
+        msg = "Данные листа недоступны или пусты."
+        if TM_DEBUG:
+            msg += f"\\n\\nДиагностика: {e!r}\\nПроверьте публикацию таблицы (File→Publish to web), верный GID листа и доступность CSV-экспорта."
+            msg += f"\\nТекущие параметры: SHEET_ID={TM_SHEET_ID}, GID={TM_SHEET_GID}, SHEET_NAME={TM_SHEET_NAME}"
+        await context.bot.send_message(chat_id, msg)
         return
+
+    if not data or not any(data):
+        note = "Данные листа недоступны или пусты."
+        if TM_DEBUG:
+            note += f"\\nПроверьте: Publish to web включён, правильный GID, лист не пустой."
+        await context.bot.send_message(chat_id, note)
+        return
+
     rows = data[1:] if len(data) > 1 else []
     matched_idx = [i for i, r in enumerate(rows, start=2) if condition_cb(r)]
     if not matched_idx:
@@ -553,13 +711,13 @@ async def tm_process_search(chat_id: int, condition_cb, context: ContextTypes.DE
 TM_MODE = "tm"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["mode"] = "docs"  # режим по умолчанию
+    context.user_data["mode"] = "docs"
     usage_left = "∞" if is_admin(update.effective_user.id) else max(0, DAILY_FREE_LIMIT - get_usage(update.effective_user.id))
     msg = (
-        "Привет!\n\n"
-        "1) Пришлите файл (.pdf, .docx или .txt), потом задайте вопрос по его содержанию (режим \"Вопросы по документам\").\n"
-        "2) Нажмите \"🤖 AI-чат\" для диалога без документов.\n"
-        "3) Нажмите \"🏷️ Товарные знаки\" для поиска по Google Sheets.\n\n"
+        "Привет!\\n\\n"
+        "1) Пришлите файл (.pdf, .docx или .txt) и задайте вопрос по его содержанию (режим \\"Вопросы по документам\\").\\n"
+        "2) Нажмите \\"🤖 AI-чат\\" для диалога без документов.\\n"
+        "3) Нажмите \\"🏷️ Товарные знаки\\" для поиска по Google Sheets.\\n\\n"
         f"Сегодняшний лимит AI-чат: {usage_left} сообщений."
     )
     await update.message.reply_text(msg, reply_markup=MAIN_KB)
@@ -580,10 +738,10 @@ async def docs_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def tm_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mode"] = TM_MODE
     intro = (
-        "Режим: 🏷️ Товарные знаки.\n\n"
-        "Отправьте название/ключевые слова — найду строки в Google Sheets и пришлю карточки.\n"
-        "Команды:\n"
-        "• /tm_reg — записи, где статус содержит «регистрация»\n"
+        "Режим: 🏷️ Товарные знаки.\\n\\n"
+        "Отправьте название/ключевые слова — найду строки в Google Sheets и пришлю карточки.\\n"
+        "Команды:\\n"
+        "• /tm_reg — записи, где статус содержит «регистрация»\\n"
         "• /tm_exp — записи, где статус содержит «экспертиза»"
     )
     await update.message.reply_text(intro, reply_markup=MAIN_KB)
@@ -596,7 +754,7 @@ async def tm_cmd_exp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def tm_handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = (update.message.text or "").strip()
-    kws = re.split(r"\s+", user_text)
+    kws = re.split(r"\\s+", user_text)
     await tm_process_search(update.effective_chat.id, lambda row: _row_matches_keywords(row, kws), context)
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -617,7 +775,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     manifest = load_manifest()
     file_hash = sha256_file(file_path)
 
-    # Проверка по хэшу (не индексировать дубликаты)
     hashes = manifest.get("hashes", {})
     if file_hash in hashes:
         await update.message.reply_text("Этот файл уже проиндексирован ранее. Можете задавать вопросы.")
@@ -634,7 +791,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ok:
         if added == 0:
             await update.message.reply_text(
-                "Файл загружен, но текст не извлечён. Возможно, это скан без текстового слоя.\n"
+                "Файл загружен, но текст не извлечён. Возможно, это скан без текстового слоя.\\n"
                 "Пришлите DOCX/TXT или PDF с текстом, либо включите OCR (tesseract+poppler/Docker)."
             )
             return
@@ -646,12 +803,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"❌ Ошибка индексации: {err}")
 
-# Унифицированный обработчик текстов с учётом режима
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_query = (update.message.text or "").strip()
     mode = context.user_data.get("mode", "docs")
 
-    # Перехватываем нажатия кнопок (если пришли текстом)
     if user_query == AI_LABEL:
         await ai_mode(update, context); return
     if user_query == DOCS_LABEL:
@@ -659,7 +814,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_query == TM_LABEL:
         await tm_mode(update, context); return
 
-    # --- AI режим ---
     if mode == "ai":
         uid = update.effective_user.id
         if not is_admin(uid):
@@ -684,9 +838,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Остаток на сегодня: {left}.")
         return
 
-    # --- TM режим ---
     if mode == "tm":
-        # Поддержка команд в этом режиме
         low = user_query.lower()
         if low.startswith("/tm_reg"):
             await tm_cmd_reg(update, context); return
@@ -695,7 +847,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tm_handle_text(update, context)
         return
 
-    # --- Режим документов ---
     if not (os.path.exists(INDEX_FILE) and os.path.exists(TEXTS_FILE)):
         await update.message.reply_text("Нет проиндексированных документов. Сначала загрузите файл.")
         return
@@ -745,9 +896,9 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"AI-чат обращений сегодня: {today_sum}")
         except Exception as e:
             lines.append(f"usage load error: {e!r}")
-        return "\n".join(lines)
+        return "\\n".join(lines)
     out = await asyncio.to_thread(stat)
-    await update.message.reply_text("Состояние:\n" + out)
+    await update.message.reply_text("Состояние:\\n" + out)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled error while processing update: %s", update)
@@ -755,7 +906,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ------------ FASTAPI + PTB APP ------------
 app = FastAPI()
 
-# Health routes
 @app.head("/")
 async def health_head():
     return Response(status_code=200)
@@ -764,7 +914,6 @@ async def health_head():
 async def health_get():
     return {"ok": True}
 
-# PTB app
 application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("debug", debug))
@@ -773,31 +922,38 @@ application.add_handler(CommandHandler("docs", docs_mode))
 application.add_handler(CommandHandler("tm", tm_mode))
 application.add_handler(CommandHandler("tm_reg", tm_cmd_reg))
 application.add_handler(CommandHandler("tm_exp", tm_cmd_exp))
-
-# Перехват нажатий на кнопки (как текст)
 application.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(AI_LABEL)}$"), ai_mode))
 application.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(DOCS_LABEL)}$"), docs_mode))
 application.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(TM_LABEL)}$"), tm_mode))
-
-# Файлы и остальной текст
 application.add_handler(MessageHandler(filters.Document.ALL, handle_file))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 application.add_error_handler(error_handler)
 
-# Lifecycle hooks
 @app.on_event("startup")
 async def _startup():
     await application.initialize()
-    await application.start()
-    logger.info("PTB initialized & started")
+    if RUN_MODE == "polling":
+        await application.start()
+        logger.info("PTB polling started")
+    elif RUN_MODE == "webhook":
+        if PUBLIC_BASE_URL:
+            try:
+                wh_url = f"{PUBLIC_BASE_URL}/telegram/{TELEGRAM_BOT_TOKEN}"
+                await application.bot.set_webhook(url=wh_url, drop_pending_updates=True)
+                logger.info("Webhook set to %s", wh_url)
+            except Exception as e:
+                logger.warning("Failed to set webhook: %r", e)
+        logger.info("PTB initialized for webhook mode")
+    logger.info("PTB initialized")
 
 @app.on_event("shutdown")
 async def _shutdown():
-    await application.stop()
+    if RUN_MODE == "polling":
+        await application.stop()
+        logger.info("PTB polling stopped")
     await application.shutdown()
-    logger.info("PTB stopped")
+    logger.info("PTB shutdown complete")
 
-# Webhook endpoints (прямо из Telegram)
 @app.post(f"/telegram/{TELEGRAM_BOT_TOKEN}")
 async def telegram_webhook_token(request: Request):
     data = await request.json()
