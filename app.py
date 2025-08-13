@@ -712,12 +712,14 @@ TM_MODE = "tm"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mode"] = "docs"
-    usage_left = "∞" if is_admin(update.effective_user.id) else max(0, DAILY_FREE_LIMIT - get_usage(update.effective_user.id))
+    usage_left = "∞" if is_admin(update.effective_user.id) else max(
+        0, DAILY_FREE_LIMIT - get_usage(update.effective_user.id)
+    )
     msg = (
-        "Привет!\\n\\n"
-        "1) Пришлите файл (.pdf, .docx или .txt) и задайте вопрос по его содержанию (режим \\"Вопросы по документам\\").\\n"
-        "2) Нажмите \\"🤖 AI-чат\\" для диалога без документов.\\n"
-        "3) Нажмите \\"🏷️ Товарные знаки\\" для поиска по Google Sheets.\\n\\n"
+        "Привет!\n\n"
+        "1) Пришлите файл (.pdf, .docx или .txt) и задайте вопрос по его содержанию (режим \"Вопросы по документам\").\n"
+        "2) Нажмите \"🤖 AI-чат\" для диалога без документов.\n"
+        "3) Нажмите \"🏷️ Товарные знаки\" для поиска по Google Sheets.\n\n"
         f"Сегодняшний лимит AI-чат: {usage_left} сообщений."
     )
     await update.message.reply_text(msg, reply_markup=MAIN_KB)
