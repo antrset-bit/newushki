@@ -17,7 +17,7 @@ import numpy as np
 import faiss
 
 from fastapi import FastAPI, Request, Response
-from telegram import Update, Document, ReplyKeyboardMarkup
+from telegram import Update, Document, ReplyKeyboardMarkup, InputFile
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 import fitz  # PyMuPDF
@@ -29,6 +29,7 @@ from google import genai
 from google.genai import types
 
 import requests
+import io
 
 # ------------ ЛОГИ ------------
 logging.basicConfig(level=logging.INFO)
@@ -522,7 +523,7 @@ def generate_direct_ai_answer(user_query: str) -> str:
         "Ты — внимательный и полезный ассистент. Отвечай чётко, по делу. "
         "Если вопрос юридический и у пользователя нет документов, давай общий совет и предупреждай о необходимости проверки юристом."
     )
-    prompt = f"СИСТЕМА:\\n{system}\\n\\nЗАПРОС ПОЛЬЗОВАТЕЛЯ:\\n{user_query}"
+    prompt = f"СИСТЕМА:\n{system}\n\nЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{user_query}"
     try:
         resp = client.models.generate_content(
             model=TEXT_MODEL_NAME,
@@ -546,11 +547,11 @@ def generate_direct_ai_answer(user_query: str) -> str:
 def _split_for_telegram(text: str, max_len: int = TELEGRAM_MSG_LIMIT - 200) -> list[str]:
     parts, buf = [], []
     cur = 0
-    paragraphs = text.replace("\\r\\n", "\\n").split("\\n\\n")
+    paragraphs = text.replace("\r\n", "\n").split("\n\n")
     for p in paragraphs:
         p = p.strip()
         if not p:
-            candidate = "\\n\\n".join(buf).strip()
+            candidate = "\n\n".join(buf).strip()
             if candidate:
                 parts.append(candidate)
                 buf, cur = [], 0
@@ -559,7 +560,7 @@ def _split_for_telegram(text: str, max_len: int = TELEGRAM_MSG_LIMIT - 200) -> l
         if cur + delta <= max_len:
             buf.append(p); cur += delta
         else:
-            candidate = "\\n\\n".join(buf).strip()
+            candidate = "\n\n".join(buf).strip()
             if candidate:
                 parts.append(candidate)
             buf, cur = [], 0
@@ -567,7 +568,7 @@ def _split_for_telegram(text: str, max_len: int = TELEGRAM_MSG_LIMIT - 200) -> l
                 parts.append(p[:max_len]); p = p[max_len:]
             if p:
                 buf = [p]; cur = len(p)
-    candidate = "\\n\\n".join(buf).strip()
+    candidate = "\n\n".join(buf).strip()
     if candidate:
         parts.append(candidate)
     return parts
@@ -576,7 +577,7 @@ async def send_long(update: Update, text: str):
     for chunk in _split_for_telegram(text):
         await update.message.reply_text(chunk, disable_web_page_preview=True)
 
-# ------------ TM HELPERS ------------
+# ------------ TM: URL/IMAGE HELPERS ------------
 def _html_escape(text: str) -> str:
     return (text.replace("&", "&amp;")
                 .replace("<", "&lt;")
@@ -584,8 +585,42 @@ def _html_escape(text: str) -> str:
                 .replace('"', "&quot;")
                 .replace("'", "&#039;"))
 
-def _is_image_url(url: str) -> bool:
-    return bool(re.match(r".+\\.(jpeg|jpg|gif|png)$", url.strip(), re.IGNORECASE))
+URL_RE = re.compile(r'(https?://[^\s<>")]+)', re.IGNORECASE)
+
+def _extract_urls(cell: str) -> list[str]:
+    """Достаём ВСЕ URL из ячейки (поддержка нескольких ссылок)."""
+    txt = str(cell or "")
+    tokens = re.split(r'[,\s]+', txt.strip())
+    urls = []
+    for t in tokens:
+        if t.startswith("http://") or t.startswith("https://"):
+            urls.append(t)
+        else:
+            urls.extend(URL_RE.findall(t))
+    seen, out = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u); out.append(u)
+    return out
+
+def _normalize_image_url(url: str) -> str:
+    """Нормализация Google Drive ссылок -> прямые ссылки на файл."""
+    u = url.strip()
+    m = re.search(r'drive\.google\.com/file/d/([^/]+)/', u)
+    if m:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    m = re.search(r'(?:[?&]id=)([A-Za-z0-9_-]+)', u)
+    if m and "drive.google.com" in u:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    return u
+
+def _is_probable_image_url(url: str) -> bool:
+    u = url.lower()
+    if any(u.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp")):
+        return True
+    if "googleusercontent.com" in u or "uc?export=download" in u or "=download" in u:
+        return True
+    return False
 
 def _format_date(value: str) -> str:
     from datetime import datetime
@@ -596,8 +631,83 @@ def _format_date(value: str) -> str:
             pass
     return value.strip()
 
+def tm_format_row(row: list[str], labels: list[str] = TM_LABELS) -> tuple[str, list[str]]:
+    formatted_lines = []
+    image_urls: list[str] = []
+
+    for idx, val in enumerate(row):
+        label = labels[idx] if idx < len(labels) else ""
+        if idx == 3:
+            continue
+
+        cell = str(val or "").strip()
+        if not cell:
+            continue
+
+        # 1) вытаскиваем все URL из ячейки
+        urls = _extract_urls(cell)
+        for u in urls:
+            nu = _normalize_image_url(u)
+            if _is_probable_image_url(nu):
+                image_urls.append(nu)
+
+        # 2) если ячейка — только ссылки, не дублируем их в тексте
+        only_links = urls and (cell == " ".join(urls) or cell == ",".join(urls))
+        if only_links:
+            continue
+
+        if re.match(r"^\d{1,4}[-./]\d{1,2}[-./]\d{1,4}$", cell):
+            cell = _format_date(cell)
+
+        if label:
+            formatted_lines.append(f"<b>{_html_escape(label)}:</b> {_html_escape(cell)}")
+        else:
+            formatted_lines.append(_html_escape(cell))
+
+    # дедуп картинок
+    seen, uniq_images = set(), []
+    for u in image_urls:
+        if u not in seen:
+            seen.add(u); uniq_images.append(u)
+
+    text = "\n".join(formatted_lines).strip()
+    return text, uniq_images
+
+async def _tm_send_image_safely(chat_id: int, url: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Сначала пробуем URL напрямую; если не вышло — скачиваем и отправляем байты."""
+    try:
+        await context.bot.send_photo(chat_id, photo=url)
+        return True
+    except Exception as e:
+        logger.warning("TM: send_photo by URL failed for %s: %r", url, e)
+
+    try:
+        r = requests.get(url, timeout=25)
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if r.status_code == 200 and (r.content and ("image/" in ct or len(r.content) > 0)):
+            buf = io.BytesIO(r.content)
+            filename = "image"
+            ul = url.lower()
+            if ".png" in ul: filename += ".png"
+            elif ".jpg" in ul or ".jpeg" in ul: filename += ".jpg"
+            elif ".webp" in ul: filename += ".webp"
+            elif ".gif" in ul: filename += ".gif"
+            else:
+                if "image/png" in ct: filename += ".png"
+                elif "image/jpeg" in ct: filename += ".jpg"
+                elif "image/webp" in ct: filename += ".webp"
+                elif "image/gif" in ct: filename += ".gif"
+                else: filename += ".bin"
+            await context.bot.send_photo(chat_id, photo=InputFile(buf, filename=filename))
+            return True
+    except Exception as e:
+        logger.warning("TM: fallback download failed for %s: %r", url, e)
+
+    return False
+
+# ------------ TM загрузка CSV ------------
 async def _tm_fetch_rows_csv(sheet_id: str, gid: str, sheet_name: str, override_url: str = "") -> list[list[str]]:
-    import csv, io
+    import csv, io as _io
     urls = []
     if override_url:
         urls.append(override_url)
@@ -615,7 +725,7 @@ async def _tm_fetch_rows_csv(sheet_id: str, gid: str, sheet_name: str, override_
             ctype = resp.headers.get("Content-Type", "")
             content = resp.content.decode("utf-8", errors="replace")
             if status == 200 and ("," in content or ";" in content or "\n" in content):
-                reader = csv.reader(io.StringIO(content))
+                reader = csv.reader(_io.StringIO(content))
                 rows = [row for row in reader]
                 if rows and any(any(cell.strip() for cell in row) for row in rows):
                     return rows
@@ -635,27 +745,6 @@ async def tm_load_data() -> list[list[str]]:
         if TM_DEBUG:
             raise
         return []
-
-def tm_format_row(row: list[str], labels: list[str] = TM_LABELS) -> tuple[str, list[str]]:
-    formatted_lines = []
-    image_urls: list[str] = []
-    for idx, val in enumerate(row):
-        label = labels[idx] if idx < len(labels) else ""
-        if idx == 3:
-            continue
-        cell = str(val or "").strip()
-        if not cell:
-            continue
-        if _is_image_url(cell):
-            image_urls.append(cell); continue
-        if re.match(r"^\\d{1,4}[-./]\\d{1,2}[-./]\\d{1,4}$", cell):
-            cell = _format_date(cell)
-        if label:
-            formatted_lines.append(f"<b>{_html_escape(label)}:</b> {_html_escape(cell)}")
-        else:
-            formatted_lines.append(_html_escape(cell))
-    text = "\\n".join(formatted_lines).strip()
-    return text, image_urls
 
 def _row_matches_registered(row: list[str]) -> bool:
     col = (row[5] if len(row) > 5 else "") or ""
@@ -679,15 +768,15 @@ async def tm_process_search(chat_id: int, condition_cb, context: ContextTypes.DE
     except Exception as e:
         msg = "Данные листа недоступны или пусты."
         if TM_DEBUG:
-            msg += f"\\n\\nДиагностика: {e!r}\\nПроверьте публикацию таблицы (File→Publish to web), верный GID листа и доступность CSV-экспорта."
-            msg += f"\\nТекущие параметры: SHEET_ID={TM_SHEET_ID}, GID={TM_SHEET_GID}, SHEET_NAME={TM_SHEET_NAME}"
+            msg += f"\n\nДиагностика: {e!r}\nПроверьте публикацию таблицы (File→Publish to web), верный GID листа и доступность CSV-экспорта."
+            msg += f"\nТекущие параметры: SHEET_ID={TM_SHEET_ID}, GID={TM_SHEET_GID}, SHEET_NAME={TM_SHEET_NAME}"
         await context.bot.send_message(chat_id, msg)
         return
 
     if not data or not any(data):
         note = "Данные листа недоступны или пусты."
         if TM_DEBUG:
-            note += f"\\nПроверьте: Publish to web включён, правильный GID, лист не пустой."
+            note += f"\nПроверьте: Publish to web включён, правильный GID, лист не пустой."
         await context.bot.send_message(chat_id, note)
         return
 
@@ -696,16 +785,16 @@ async def tm_process_search(chat_id: int, condition_cb, context: ContextTypes.DE
     if not matched_idx:
         await context.bot.send_message(chat_id, "Данные не найдены.")
         return
+
     for i in matched_idx:
         row = data[i-1]
         text, images = tm_format_row(row)
         if text:
             await context.bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=False)
         for url in images:
-            try:
-                await context.bot.send_photo(chat_id, photo=url)
-            except Exception as e:
-                logger.warning("TM: не удалось отправить фото %s: %s", url, repr(e))
+            ok = await _tm_send_image_safely(chat_id, url, context)
+            if not ok:
+                logger.warning("TM: failed to send image after fallback: %s", url)
 
 # ------------ TELEGRAM HANDLERS ------------
 TM_MODE = "tm"
@@ -740,10 +829,10 @@ async def docs_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def tm_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mode"] = TM_MODE
     intro = (
-        "Режим: 🏷️ Товарные знаки.\\n\\n"
-        "Отправьте название/ключевые слова — найду строки в Google Sheets и пришлю карточки.\\n"
-        "Команды:\\n"
-        "• /tm_reg — записи, где статус содержит «регистрация»\\n"
+        "Режим: 🏷️ Товарные знаки.\n\n"
+        "Отправьте название/ключевые слова — найду строки в Google Sheets и пришлю карточки.\n"
+        "Команды:\n"
+        "• /tm_reg — записи, где статус содержит «регистрация»\n"
         "• /tm_exp — записи, где статус содержит «экспертиза»"
     )
     await update.message.reply_text(intro, reply_markup=MAIN_KB)
@@ -756,7 +845,7 @@ async def tm_cmd_exp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def tm_handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = (update.message.text or "").strip()
-    kws = re.split(r"\\s+", user_text)
+    kws = re.split(r"\s+", user_text)
     await tm_process_search(update.effective_chat.id, lambda row: _row_matches_keywords(row, kws), context)
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -776,7 +865,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     manifest = load_manifest()
     file_hash = sha256_file(file_path)
-
     hashes = manifest.get("hashes", {})
     if file_hash in hashes:
         await update.message.reply_text("Этот файл уже проиндексирован ранее. Можете задавать вопросы.")
@@ -793,7 +881,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ok:
         if added == 0:
             await update.message.reply_text(
-                "Файл загружен, но текст не извлечён. Возможно, это скан без текстового слоя.\\n"
+                "Файл загружен, но текст не извлечён. Возможно, это скан без текстового слоя.\n"
                 "Пришлите DOCX/TXT или PDF с текстом, либо включите OCR (tesseract+poppler/Docker)."
             )
             return
@@ -898,9 +986,9 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"AI-чат обращений сегодня: {today_sum}")
         except Exception as e:
             lines.append(f"usage load error: {e!r}")
-        return "\\n".join(lines)
+        return "\n".join(lines)
     out = await asyncio.to_thread(stat)
-    await update.message.reply_text("Состояние:\\n" + out)
+    await update.message.reply_text("Состояние:\n" + out)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled error while processing update: %s", update)
