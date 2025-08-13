@@ -54,6 +54,7 @@ INDEX_FILE = os.getenv("FAISS_INDEX", "/tmp/index.faiss")
 TEXTS_FILE = os.getenv("TEXTS_FILE", "/tmp/texts.pkl")
 MANIFEST_FILE = os.getenv("MANIFEST_FILE", "/tmp/manifest.json")
 USAGE_FILE = os.getenv("USAGE_FILE", "/tmp/usage.json")
+DOCMETA_FILE = os.getenv("DOCMETA_FILE", "/tmp/docmeta.json")  # метаданные источников
 
 DAILY_FREE_LIMIT = int(os.getenv("DAILY_FREE_LIMIT", "10"))
 ADMIN_USER_IDS = set(int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit())
@@ -111,6 +112,7 @@ Path(Path(INDEX_FILE).parent).mkdir(parents=True, exist_ok=True)
 Path(Path(TEXTS_FILE).parent).mkdir(parents=True, exist_ok=True)
 Path(Path(MANIFEST_FILE).parent).mkdir(parents=True, exist_ok=True)
 Path(Path(USAGE_FILE).parent).mkdir(parents=True, exist_ok=True)
+Path(Path(DOCMETA_FILE).parent).mkdir(parents=True, exist_ok=True)
 
 # ------------ КЛИЕНТ GEMINI ------------
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -168,6 +170,20 @@ def load_manifest() -> dict:
 def save_manifest(m: dict):
     with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
         json.dump(m, f, ensure_ascii=False, indent=2)
+
+# ------------ МЕТАДАННЫЕ ДОКУМЕНТОВ ------------
+def load_docmeta() -> dict:
+    if os.path.exists(DOCMETA_FILE):
+        try:
+            with open(DOCMETA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_docmeta(meta: dict):
+    with open(DOCMETA_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
 
 def load_texts() -> List[str]:
     if os.path.exists(TEXTS_FILE):
@@ -455,11 +471,32 @@ def index_file(file_path: str) -> Tuple[int, int]:
     if not new_embeddings:
         existing = load_index()
         return (0, existing.ntotal if existing else 0)
+
+    # Индексы чанков, которые будут добавлены
+    base_ntotal = 0
+    existing_index = load_index()
+    if existing_index is not None:
+        base_ntotal = getattr(existing_index, "ntotal", 0)
+
+    # Сохраняем индекс и тексты
     mat = np.vstack(new_embeddings).astype("float32")
     index.add(mat)
     save_index(index)
+
     texts.extend(new_texts)
     save_texts(texts)
+
+    # Записываем метаданные владельца чанков
+    file_hash = sha256_file(file_path)
+    meta = load_docmeta()
+    added_ids = list(range(base_ntotal, base_ntotal + len(new_embeddings)))
+    rec = meta.get(file_hash, {"fname": os.path.basename(file_path), "time": int(time.time()), "chunks": []})
+    rec["fname"] = os.path.basename(file_path)
+    rec["time"] = int(time.time())
+    rec["chunks"] = sorted(set((rec.get("chunks") or []) + added_ids))
+    meta[file_hash] = rec
+    save_docmeta(meta)
+
     total = index.ntotal if hasattr(index, "ntotal") else len(texts)
     return (len(new_texts), total)
 
@@ -474,6 +511,123 @@ def retrieve_chunks(query: str, k: int = RETRIEVAL_K) -> List[str]:
     D, I = index.search(np.array([q_emb], dtype="float32"), k=min(k, len(texts)))
     ids = [i for i in I[0] if 0 <= i < len(texts)]
     return [texts[i] for i in ids]
+
+def rebuild_faiss_from_texts(texts: List[str]) -> int:
+    """Полностью пересоздаёт FAISS-индекс из списка текстов. Возвращает количество добавленных векторов."""
+    if not texts:
+        if os.path.exists(INDEX_FILE):
+            os.remove(INDEX_FILE)
+        save_texts([])
+        return 0
+
+    # Определим размерность
+    dim_vec = None
+    for t in texts:
+        try:
+            dim_vec = get_embedding(t)
+            break
+        except Exception:
+            continue
+    if dim_vec is None:
+        raise RuntimeError("Не удалось получить эмбеддинг ни для одного чанка.")
+
+    index = faiss.IndexFlatL2(len(dim_vec))
+    embs = []
+    for t in texts:
+        try:
+            embs.append(get_embedding(t))
+            time.sleep(0.01)
+        except Exception as e:
+            logger.warning("rebuild: пропущен чанк из-за ошибки эмбеддинга: %r", e)
+            continue
+    if not embs:
+        raise RuntimeError("rebuild: нет ни одного валидного эмбеддинга.")
+    mat = np.vstack(embs).astype("float32")
+    index.add(mat)
+    save_index(index)
+    save_texts(texts)
+    return index.ntotal
+
+def delete_document_from_training(file_hash: str, also_remove_file: bool = False) -> tuple[bool, str]:
+    """Удаляет все чанки документа из texts.pkl и пересобирает FAISS.
+       also_remove_file=True — дополнительно удаляет физический файл из DOC_FOLDER (если он существует).
+       Возвращает (ok, message)."""
+    meta = load_docmeta()
+    if file_hash not in meta:
+        return False, "Не найдено метаданных по этому файлу (возможно, индексировалось старой версией без учёта источников). " \
+                      "Воспользуйтесь /admin_rebuild для полной пересборки."
+
+    # Запомним имя заранее (до удаления из meta)
+    fname_hint = meta[file_hash].get("fname", "")
+
+    # Готовим новое тело текстов без удаляемых чанков
+    texts = load_texts()
+    drop_ids = set(meta[file_hash].get("chunks") or [])
+    if not texts:
+        return False, "texts.pkl пуст — нечего удалять."
+    keep_texts = [t for i, t in enumerate(texts) if i not in drop_ids]
+
+    # Пересобираем индекс
+    try:
+        total = rebuild_faiss_from_texts(keep_texts)
+    except Exception as e:
+        return False, f"Ошибка пересборки индекса: {e!r}"
+
+    # Обновляем метаданные: удаляем запись, у остальных убираем старые индексы chunks
+    meta.pop(file_hash, None)
+    for k in list(meta.keys()):
+        if "chunks" in meta[k]:
+            meta[k].pop("chunks", None)
+    save_docmeta(meta)
+
+    # Обновляем manifest (опционально убираем след)
+    man = load_manifest()
+    hs = man.get("hashes", {})
+    if file_hash in hs:
+        hs.pop(file_hash, None)
+        man["hashes"] = hs
+        with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
+            json.dump(man, f, ensure_ascii=False, indent=2)
+
+    removed_file_msg = ""
+    if also_remove_file and fname_hint:
+        try:
+            for name in os.listdir(DOC_FOLDER):
+                if name == fname_hint:
+                    os.unlink(os.path.join(DOC_FOLDER, name))
+                    removed_file_msg = f" Файл {fname_hint} удалён."
+                    break
+        except Exception as e:
+            removed_file_msg = f" Не удалось удалить файл: {e!r}"
+
+    return True, f"Документ удалён из обучения. Текущих векторов в индексе: {total}.{removed_file_msg}"
+
+def full_reindex_all_documents() -> tuple[int, list[str]]:
+    """Полностью пересобирает индекс по всем файлам в DOC_FOLDER. Возвращает (total_vectors, errors)."""
+    # Сброс текущего индекса/текстов/метаданных
+    if os.path.exists(INDEX_FILE):
+        os.remove(INDEX_FILE)
+    save_texts([])
+    save_docmeta({})
+
+    errors = []
+    total_added = 0
+    for name in sorted(os.listdir(DOC_FOLDER)):
+        path = os.path.join(DOC_FOLDER, name)
+        if not os.path.isfile(path):
+            continue
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in (".pdf", ".docx", ".txt"):
+            continue
+        try:
+            added, _ = index_file(path)
+            total_added += added
+            time.sleep(0.05)
+        except Exception as e:
+            errors.append(f"{name}: {e!r}")
+    idx = load_index()
+    total_vectors = getattr(idx, "ntotal", 0) if idx else 0
+    return total_vectors, errors
 
 # ------------ ГЕНЕРАЦИЯ ------------
 def generate_answer_with_gemini(user_query: str, retrieved_chunks: List[str]) -> str:
@@ -799,6 +953,9 @@ async def tm_process_search(chat_id: int, condition_cb, context: ContextTypes.DE
 # ------------ TELEGRAM HANDLERS ------------
 TM_MODE = "tm"
 
+def _admin_only(update: Update) -> bool:
+    return is_admin(update.effective_user.id)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mode"] = "docs"
     usage_left = "∞" if is_admin(update.effective_user.id) else max(
@@ -886,7 +1043,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         manifest.setdefault("hashes", {})[file_hash] = {"fname": os.path.basename(file_path), "time": int(time.time())}
-        save_manifest(manifest)
+        with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
         await update.message.reply_text(
             f"Индексация завершена. Добавлено фрагментов: {added}. Всего: {total}. Теперь можно задавать вопросы."
         )
@@ -966,6 +1124,7 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fs(TEXTS_FILE),
             fs(MANIFEST_FILE),
             fs(USAGE_FILE),
+            fs(DOCMETA_FILE),
             f"ADMIN_USER_IDS={sorted(list(ADMIN_USER_IDS))}",
             f"DAILY_FREE_LIMIT={DAILY_FREE_LIMIT}",
         ]
@@ -990,6 +1149,118 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     out = await asyncio.to_thread(stat)
     await update.message.reply_text("Состояние:\n" + out)
 
+# -------- Админ-команды --------
+def _admin_only(update: Update) -> bool:
+    return is_admin(update.effective_user.id)
+
+async def admin_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _admin_only(update):
+        await update.message.reply_text("Доступ только для администраторов.")
+        return
+    meta = load_docmeta()
+    if not meta:
+        await update.message.reply_text("Список пуст. Возможно, ещё ничего не индексировалось новой версией.\n"
+                                        "Используйте /admin_rebuild для полной пересборки с учётом источников.")
+        return
+    lines = []
+    for i, (h, rec) in enumerate(sorted(meta.items(), key=lambda kv: kv[1].get("time", 0)) , start=1):
+        fname = rec.get("fname", "—")
+        t = rec.get("time", 0)
+        from datetime import datetime
+        ts = datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M") if t else "—"
+        nchunks = len(rec.get("chunks", [])) if rec.get("chunks") else "?"
+        lines.append(f"{i}. {fname} | chunks={nchunks} | {ts} | hash={h[:10]}...")
+    idx = load_index()
+    total_vec = getattr(idx, "ntotal", 0) if idx else 0
+    await update.message.reply_text("Документы в обучении:\n" + "\n".join(lines) + f"\n\nВсего векторов: {total_vec}")
+
+async def admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _admin_only(update):
+        await update.message.reply_text("Доступ только для администраторов.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Использование: /admin_del <номер_из_/admin_docs|префикс_hash>")
+        return
+
+    target = args[0].strip()
+    meta = load_docmeta()
+    items = list(sorted(meta.items(), key=lambda kv: kv[1].get("time", 0)))
+
+    # По номеру
+    if target.isdigit():
+        idx = int(target) - 1
+        if not (0 <= idx < len(items)):
+            await update.message.reply_text("Неверный номер.")
+            return
+        file_hash, rec = items[idx]
+    else:
+        # По префиксу hash
+        matches = [(h, r) for h, r in items if h.startswith(target)]
+        if not matches:
+            await update.message.reply_text("Хеш не найден.")
+            return
+        if len(matches) > 1:
+            await update.message.reply_text("Найдены несколько совпадений по префиксу — уточните.")
+            return
+        file_hash, rec = matches[0]
+
+    ok, msg = delete_document_from_training(file_hash, also_remove_file=False)
+    await update.message.reply_text(("✅ " if ok else "❌ ") + msg)
+
+async def admin_del_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _admin_only(update):
+        await update.message.reply_text("Доступ только для администраторов.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Использование: /admin_del_file <номер_из_/admin_docs|префикс_hash>")
+        return
+
+    target = args[0].strip()
+    meta = load_docmeta()
+    items = list(sorted(meta.items(), key=lambda kv: kv[1].get("time", 0)))
+
+    if target.isdigit():
+        idx = int(target) - 1
+        if not (0 <= idx < len(items)):
+            await update.message.reply_text("Неверный номер.")
+            return
+        file_hash, rec = items[idx]
+    else:
+        matches = [(h, r) for h, r in items if h.startswith(target)]
+        if not matches:
+            await update.message.reply_text("Хеш не найден.")
+            return
+        if len(matches) > 1:
+            await update.message.reply_text("Найдены несколько совпадений по префиксу — уточните.")
+            return
+        file_hash, rec = matches[0]
+
+    ok, msg = delete_document_from_training(file_hash, also_remove_file=True)
+    await update.message.reply_text(("✅ " if ok else "❌ ") + msg)
+
+async def admin_rebuild(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _admin_only(update):
+        await update.message.reply_text("Доступ только для администраторов.")
+        return
+
+    await update.message.reply_text("Начинаю полную пересборку индекса... Это может занять время.")
+    def _job():
+        try:
+            total, errors = full_reindex_all_documents()
+            return (True, total, errors)
+        except Exception as e:
+            return (False, 0, [repr(e)])
+    ok, total, errors = await asyncio.to_thread(_job)
+    if ok:
+        msg = f"Готово. Векторов в индексе: {total}."
+        if errors:
+            msg += "\nЧасть файлов пропущена:\n- " + "\n- ".join(errors)
+        await update.message.reply_text(msg)
+    else:
+        await update.message.reply_text("❌ Ошибка пересборки:\n" + "\n".join(errors))
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled error while processing update: %s", update)
 
@@ -1012,6 +1283,13 @@ application.add_handler(CommandHandler("docs", docs_mode))
 application.add_handler(CommandHandler("tm", tm_mode))
 application.add_handler(CommandHandler("tm_reg", tm_cmd_reg))
 application.add_handler(CommandHandler("tm_exp", tm_cmd_exp))
+
+# Admin commands
+application.add_handler(CommandHandler("admin_docs", admin_docs))
+application.add_handler(CommandHandler("admin_del", admin_del))
+application.add_handler(CommandHandler("admin_del_file", admin_del_file))
+application.add_handler(CommandHandler("admin_rebuild", admin_rebuild))
+
 application.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(AI_LABEL)}$"), ai_mode))
 application.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(DOCS_LABEL)}$"), docs_mode))
 application.add_handler(MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(TM_LABEL)}$"), tm_mode))
